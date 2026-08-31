@@ -5,40 +5,85 @@ on:
     branches: [main]
     paths:
       - "infra/**"
+      - ".github/workflows/terraform-pr-plan.yml"
+      - ".github/workflows/deploy-dev.yml"
+      - ".github/workflows/promote.yml"
 
 permissions:
   contents: read
+  pull-requests: read
+  issues: write
+
+concurrency:
+  group: terraform-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
-  plan-dev:
-    name: Plan DEV
+  plan:
+    name: Plan ${{ matrix.environment }}
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: infra/envs/dev
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, staging, prod]
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
         with:
           terraform_version: 1.9.8
 
       - name: Terraform fmt check
-        run: terraform fmt -check -recursive ../../
+        run: terraform fmt -check -recursive infra
 
       - name: Terraform init
+        working-directory: infra/envs/${{ matrix.environment }}
         run: terraform init -input=false
 
       - name: Terraform validate
+        working-directory: infra/envs/${{ matrix.environment }}
         run: terraform validate
 
-      - name: Terraform plan DEV
+      - name: Terraform plan
+        working-directory: infra/envs/${{ matrix.environment }}
         run: >-
           terraform plan
           -input=false
-          -no-color
+          -out=tfplan
           -var-file=../../config/release.tfvars
           -var="release_version=${{ github.event.pull_request.head.sha }}"
+
+      - name: Render plan
+        working-directory: infra/envs/${{ matrix.environment }}
+        run: terraform show -no-color tfplan > plan.txt
+
+      - name: Publish plan to PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          set -euo pipefail
+          PLAN_FILE="infra/envs/${ENVIRONMENT}/plan.txt"
+          MARKER="<!-- terraform-plan-${ENVIRONMENT} -->"
+          PLAN_CONTENT="$(head -c 55000 "$PLAN_FILE")"
+          BODY=$(printf '%s\n### Terraform Plan — %s\n\nCommit: `%s`\n\n```text\n%s\n```\n' \
+            "$MARKER" "${ENVIRONMENT^^}" "${{ github.event.pull_request.head.sha }}" "$PLAN_CONTENT")
+
+          COMMENT_ID=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments?per_page=100" \
+            --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" \
+            | head -n 1 || true)
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" \
+              -f body="$BODY" >/dev/null
+          else
+            gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/comments" \
+              -f body="$BODY" >/dev/null
+          fi
