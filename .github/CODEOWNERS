@@ -1,0 +1,5 @@
+# Lab owner. In a real company, replace @Valliam with a platform/security team.
+/infra/modules/ @Valliam
+/infra/envs/staging/ @Valliam
+/infra/envs/prod/ @Valliam
+/.github/workflows/ @Valliam
