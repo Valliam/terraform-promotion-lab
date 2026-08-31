@@ -1,0 +1,52 @@
+name: Deploy DEV
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/**"
+
+permissions:
+  contents: read
+
+jobs:
+  apply-dev:
+    name: Apply DEV
+    runs-on: ubuntu-latest
+    environment: development
+    defaults:
+      run:
+        working-directory: infra/envs/dev
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.9.8
+
+      - name: Terraform init
+        run: terraform init -input=false
+
+      - name: Terraform plan DEV
+        run: >-
+          terraform plan
+          -input=false
+          -out=tfplan
+          -var-file=../../config/release.tfvars
+          -var="release_version=${{ github.sha }}"
+
+      - name: Terraform apply DEV
+        run: terraform apply -input=false tfplan
+
+      - name: Show DEV output
+        run: terraform output -json
+
+      - name: Upload DEV state (lab only)
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-tfstate-dev-${{ github.run_id }}
+          path: infra/envs/dev/terraform.tfstate
+          if-no-files-found: error
