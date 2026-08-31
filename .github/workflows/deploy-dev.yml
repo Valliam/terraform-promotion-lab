@@ -8,27 +8,37 @@ on:
 
 permissions:
   contents: read
+  deployments: write
+
+concurrency:
+  group: terraform-development
+  cancel-in-progress: false
 
 jobs:
   apply-dev:
     name: Apply DEV
     runs-on: ubuntu-latest
-    environment: development
+    environment:
+      name: development
+      deployment: false
     defaults:
       run:
         working-directory: infra/envs/dev
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
         with:
           terraform_version: 1.9.8
 
       - name: Terraform init
         run: terraform init -input=false
+
+      - name: Terraform validate
+        run: terraform validate
 
       - name: Terraform plan DEV
         run: >-
@@ -44,8 +54,30 @@ jobs:
       - name: Show DEV output
         run: terraform output -json
 
+      - name: Record successful DEV deployment
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          DEPLOYMENT_PAYLOAD=$(jq -n \
+            --arg ref "$RELEASE_REF" \
+            '{ref:$ref, environment:"development", task:"terraform-promotion", auto_merge:false, required_contexts:[], description:"Terraform DEV deployment"}')
+
+          DEPLOYMENT_ID=$(gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/deployments" \
+            --input - --jq '.id' <<< "$DEPLOYMENT_PAYLOAD")
+
+          STATUS_PAYLOAD=$(jq -n \
+            '{state:"success", description:"Terraform DEV apply completed successfully"}')
+
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/deployments/${DEPLOYMENT_ID}/statuses" \
+            --input - <<< "$STATUS_PAYLOAD" >/dev/null
+
       - name: Upload DEV state (lab only)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: lab-tfstate-dev-${{ github.run_id }}
           path: infra/envs/dev/terraform.tfstate
