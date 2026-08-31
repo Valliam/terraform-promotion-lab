@@ -11,39 +11,111 @@ on:
           - staging
           - prod
       release_ref:
-        description: Exact commit SHA that already passed DEV
+        description: Exact 40-character commit SHA to promote
         required: true
         type: string
 
 permissions:
   contents: read
+  deployments: write
+
+concurrency:
+  group: terraform-${{ inputs.target_environment }}
+  cancel-in-progress: false
 
 jobs:
-  promote:
-    name: Promote to ${{ inputs.target_environment }}
+  preflight:
+    name: Validate promotion chain
     runs-on: ubuntu-latest
-    environment: ${{ inputs.target_environment }}
 
     steps:
+      - name: Validate exact commit SHA
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "release_ref must be a full 40-character lowercase commit SHA"
+            exit 1
+          fi
+
       - name: Checkout exact release
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           ref: ${{ inputs.release_ref }}
           fetch-depth: 0
 
       - name: Verify release is from main
+        env:
+          RELEASE_REF: ${{ inputs.release_ref }}
         run: |
+          set -euo pipefail
           git fetch origin main
-          git merge-base --is-ancestor "${{ inputs.release_ref }}" origin/main
+          git merge-base --is-ancestor "$RELEASE_REF" origin/main
+
+      - name: Verify previous environment succeeded
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ inputs.release_ref }}
+          TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
+        run: |
+          set -euo pipefail
+
+          if [ "$TARGET_ENVIRONMENT" = "staging" ]; then
+            PREVIOUS_ENVIRONMENT="development"
+          else
+            PREVIOUS_ENVIRONMENT="staging"
+          fi
+
+          echo "Checking that $RELEASE_REF successfully deployed to $PREVIOUS_ENVIRONMENT"
+
+          DEPLOYMENTS=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/deployments?sha=${RELEASE_REF}&environment=${PREVIOUS_ENVIRONMENT}&per_page=100")
+
+          SUCCESS_FOUND=false
+          while read -r DEPLOYMENT_ID; do
+            [ -z "$DEPLOYMENT_ID" ] && continue
+            STATE=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/deployments/${DEPLOYMENT_ID}/statuses?per_page=1" \
+              --jq '.[0].state // ""')
+            if [ "$STATE" = "success" ]; then
+              SUCCESS_FOUND=true
+              break
+            fi
+          done < <(echo "$DEPLOYMENTS" | jq -r '.[] | select(.task == "terraform-promotion") | .id')
+
+          if [ "$SUCCESS_FOUND" != "true" ]; then
+            echo "No successful $PREVIOUS_ENVIRONMENT deployment found for $RELEASE_REF"
+            exit 1
+          fi
+
+  promote:
+    name: Promote to ${{ inputs.target_environment }}
+    needs: preflight
+    runs-on: ubuntu-latest
+    environment:
+      name: ${{ inputs.target_environment }}
+      deployment: false
+
+    steps:
+      - name: Checkout exact release
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.release_ref }}
+          fetch-depth: 0
 
       - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd
         with:
           terraform_version: 1.9.8
 
       - name: Terraform init
         working-directory: infra/envs/${{ inputs.target_environment }}
         run: terraform init -input=false
+
+      - name: Terraform validate
+        working-directory: infra/envs/${{ inputs.target_environment }}
+        run: terraform validate
 
       - name: Terraform plan
         working-directory: infra/envs/${{ inputs.target_environment }}
@@ -62,8 +134,31 @@ jobs:
         working-directory: infra/envs/${{ inputs.target_environment }}
         run: terraform output -json
 
+      - name: Record successful promotion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REF: ${{ inputs.release_ref }}
+          TARGET_ENVIRONMENT: ${{ inputs.target_environment }}
+        run: |
+          set -euo pipefail
+          DEPLOYMENT_PAYLOAD=$(jq -n \
+            --arg ref "$RELEASE_REF" \
+            --arg env "$TARGET_ENVIRONMENT" \
+            '{ref:$ref, environment:$env, task:"terraform-promotion", auto_merge:false, required_contexts:[], description:"Terraform environment promotion"}')
+
+          DEPLOYMENT_ID=$(gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/deployments" \
+            --input - --jq '.id' <<< "$DEPLOYMENT_PAYLOAD")
+
+          STATUS_PAYLOAD=$(jq -n \
+            '{state:"success", description:"Terraform promotion completed successfully"}')
+
+          gh api --method POST \
+            "repos/${GITHUB_REPOSITORY}/deployments/${DEPLOYMENT_ID}/statuses" \
+            --input - <<< "$STATUS_PAYLOAD" >/dev/null
+
       - name: Upload state (lab only)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: lab-tfstate-${{ inputs.target_environment }}-${{ github.run_id }}
           path: infra/envs/${{ inputs.target_environment }}/terraform.tfstate
